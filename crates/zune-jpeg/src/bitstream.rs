@@ -127,6 +127,12 @@ pub(crate) struct BitStream {
     spec_end:                u8,
     pub eob_run:             i32,
     pub overread_by:         usize,
+    /// Zero bits appended to the buffer after the data ended, which a scan read past its data
+    /// would consume, and which a scan whose data held all of its MCUs never consumes.
+    zeros_past_end:          usize,
+    /// Set once the decoder takes more bits than the buffer holds, which only a scan read past
+    /// its data does.
+    exhausted:               bool,
     /// True if we have seen end of image marker.
     /// Don't read anything after that.
     pub seen_eoi:            bool,
@@ -146,6 +152,8 @@ impl BitStream {
             spec_end:            0,
             eob_run:             0,
             overread_by:         0,
+            zeros_past_end:      0,
+            exhausted:           false,
             seen_eoi:            false,
         }
     }
@@ -164,6 +172,8 @@ impl BitStream {
             spec_end:            spec_end,
             eob_run:             0,
             overread_by:         0,
+            zeros_past_end:      0,
+            exhausted:           false,
             seen_eoi:            false,
         }
     }
@@ -187,9 +197,12 @@ impl BitStream {
         /// to full refill
         macro_rules! refill {
             ($buffer:expr,$byte:expr,$bits_left:expr) => {
-                // read a byte from the stream
+                // read a byte from the stream; one read once the data has ended is a zero
+                // the data never held
+                let past_end = reader.eof()?;
                 $byte = u64::from(reader.read_u8());
                 self.overread_by += usize::from(reader.eof()?);
+                self.zeros_past_end += 8 * usize::from(past_end);
                 // append to the buffer
                 // JPEG is a MSB type buffer so that means we append this
                 // to the lower end (0..8) of the buffer and push the rest bits above..
@@ -246,6 +259,9 @@ impl BitStream {
                 // fill with zeroes
                 self.buffer <<= 32;
                 self.bits_left += 32;
+                if self.overread_by > 0 {
+                    self.zeros_past_end += 32;
+                }
                 self.aligned_buffer = self.buffer << (64 - self.bits_left);
                 return Ok(true);
             }
@@ -297,6 +313,19 @@ impl BitStream {
         }
         return Ok(true);
     }
+    /// Whether the decoder has consumed bits past the end of the data.
+    ///
+    /// `overread_by` turns positive when the reader reaches the end of the data, which its
+    /// lookahead does while the bits of the last MCUs are still in the buffer, unconsumed. The
+    /// zeros appended after that end are the last bits in the buffer, so they have been consumed
+    /// once fewer bits are left than they make up, or once the decoder has taken more bits than
+    /// the buffer held: until then every bit the decoder took was in the data, and a scan whose
+    /// data holds all of its MCUs is decoded whole, with or without the `EOI` after it.
+    pub(crate) fn consumed_past_end(&self) -> bool {
+        self.overread_by > 0
+            && (self.exhausted || self.zeros_past_end > usize::from(self.bits_left))
+    }
+
     /// Decode the DC coefficient in a MCU block.
     ///
     /// The decoded coefficient is written to `dc_prediction`
@@ -519,7 +548,9 @@ impl BitStream {
 
         self.aligned_buffer = self.aligned_buffer.rotate_left(u32::from(n_bits));
         let bits = (self.aligned_buffer & mask) as i32;
-        self.bits_left = self.bits_left.wrapping_sub(n_bits);
+        let (left, exhausted) = self.bits_left.overflowing_sub(n_bits);
+        self.bits_left = left;
+        self.exhausted |= exhausted;
         bits
     }
 
@@ -778,6 +809,8 @@ impl BitStream {
         self.buffer = 0;
         self.aligned_buffer = 0;
         self.eob_run = 0;
+        // the zeros went with the buffer
+        self.zeros_past_end = 0;
     }
 }
 

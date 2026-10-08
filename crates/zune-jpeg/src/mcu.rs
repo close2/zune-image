@@ -199,7 +199,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             trace!("Decoding MCU width: {mcu_width}, height: {mcu_height}");
 
             for i in 0..mcu_height {
-                if stream.overread_by > 0 {
+                if stream.consumed_past_end() {
                     pixels.get_mut(pixels_written..).map(|v| v.fill(128));
                     if self.options.strict_mode() {
                         return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
